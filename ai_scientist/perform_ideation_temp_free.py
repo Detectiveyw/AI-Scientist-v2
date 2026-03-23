@@ -5,6 +5,8 @@ import re
 import traceback
 from typing import Any, Dict, List
 
+from ai_scientist.utils.json_utils import parse_arguments_json
+
 import sys
 
 sys.path.append(osp.join(osp.dirname(__file__), ".."))
@@ -209,11 +211,8 @@ def generate_temp_free_idea(
                     if action in tools_dict:
                         # It's a tool we have defined
                         tool = tools_dict[action]
-                        # Parse arguments
-                        try:
-                            arguments_json = json.loads(arguments_text)
-                        except json.JSONDecodeError:
-                            raise ValueError(f"Invalid arguments JSON for {action}.")
+                        # Parse arguments (with repair fallback for bare backslashes)
+                        arguments_json = parse_arguments_json(arguments_text)
 
                         # Use the tool
                         try:
@@ -223,20 +222,19 @@ def generate_temp_free_idea(
                         except Exception as e:
                             last_tool_results = f"Error using tool {action}: {str(e)}"
                     elif action == "FinalizeIdea":
-                        # Parse arguments
-                        try:
-                            arguments_json = json.loads(arguments_text)
-                            idea = arguments_json.get("idea")
-                            if not idea:
-                                raise ValueError("Missing 'idea' in arguments.")
+                        # Parse arguments (with repair fallback for bare backslashes).
+                        # parse_arguments_json raises ValueError with a clear message on
+                        # failure; the outer except block will catch and log it.
+                        arguments_json = parse_arguments_json(arguments_text)
+                        idea = arguments_json.get("idea")
+                        if not idea:
+                            raise ValueError("Missing 'idea' in arguments.")
 
-                            # Append the idea to the archive
-                            idea_str_archive.append(json.dumps(idea))
-                            print(f"Proposal finalized: {idea}")
-                            idea_finalized = True
-                            break
-                        except json.JSONDecodeError:
-                            raise ValueError("Invalid arguments JSON for FinalizeIdea.")
+                        # Append the idea to the archive
+                        idea_str_archive.append(json.dumps(idea))
+                        print(f"Proposal finalized: {idea}")
+                        idea_finalized = True
+                        break
                     else:
                         print(
                             "Invalid action. Please specify one of the available tools."
