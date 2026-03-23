@@ -125,6 +125,149 @@ Results from your last action (if any):
 """
 
 
+# Prompt used to ask the LLM to re-emit corrected JSON
+_JSON_REPAIR_SYSTEM = "You are a JSON repair assistant. Output only raw, valid JSON."
+_JSON_REPAIR_USER_TMPL = (
+    "The text below was meant to be valid JSON but contains syntax errors "
+    "(likely unescaped backslashes, e.g. \\alpha must be written as \\\\alpha "
+    "inside a JSON string). Please re-emit ONLY the corrected JSON with every "
+    "backslash properly escaped. Do not include markdown fences or any "
+    "explanation — just the raw JSON object.\n\n{text}"
+)
+# Number of characters included in the parse-error preview message.
+_ERROR_PREVIEW_LENGTH = 200
+
+
+def repair_json_backslashes(text: str) -> str:
+    """Escape invalid backslash sequences inside JSON string values.
+
+    Scans the JSON text character-by-character, tracking whether the current
+    position is inside a JSON string literal.  Inside a string, any backslash
+    that does not start a *valid* JSON escape sequence (``\\"``, ``\\\\``,
+    ``\\/``, ``\\b``, ``\\f``, ``\\n``, ``\\r``, ``\\t``, ``\\uXXXX``) is
+    doubled so that the resulting text can be parsed by :func:`json.loads`.
+
+    Characters outside string literals are passed through unchanged.
+    """
+    result: list[str] = []
+    i = 0
+    n = len(text)
+    in_string = False
+
+    while i < n:
+        ch = text[i]
+
+        if not in_string:
+            if ch == '"':
+                in_string = True
+            result.append(ch)
+            i += 1
+            continue
+
+        # --- inside a JSON string literal ---
+        if ch == '\\':
+            if i + 1 >= n:
+                # Trailing backslash at end of input – double it
+                result.append('\\\\')
+                i += 1
+                continue
+
+            nxt = text[i + 1]
+            if nxt in ('"', '\\', '/', 'b', 'f', 'n', 'r', 't'):
+                # Valid single-character escape – keep as-is and skip both chars
+                result.append(ch)
+                result.append(nxt)
+                i += 2
+            elif nxt == 'u':
+                # \uXXXX – valid only with exactly 4 hex digits
+                hex_seq = text[i + 2 : i + 6]
+                if len(hex_seq) == 4 and all(
+                    c in '0123456789abcdefABCDEF' for c in hex_seq
+                ):
+                    result.append(text[i : i + 6])
+                    i += 6
+                else:
+                    # Malformed \u – double the backslash
+                    result.append('\\\\')
+                    i += 1
+            else:
+                # Invalid escape – double the backslash; nxt is handled next loop
+                result.append('\\\\')
+                i += 1
+        elif ch == '"':
+            # Unescaped quote ends the string
+            in_string = False
+            result.append(ch)
+            i += 1
+        else:
+            result.append(ch)
+            i += 1
+
+    return ''.join(result)
+
+
+def parse_finalize_idea_args(
+    arguments_text: str,
+    client: Any,
+    model: str,
+    max_attempts: int = 5,
+) -> dict:
+    """Parse the JSON arguments for the FinalizeIdea action with retry/repair.
+
+    Attempt order for each try:
+
+    a) Plain :func:`json.loads`.
+    b) :func:`repair_json_backslashes` then :func:`json.loads`.
+    c) Re-prompt *client/model* to re-emit valid JSON, then loop.
+
+    After *max_attempts* failed cycles, raise :class:`ValueError` with a
+    truncated preview of the offending text and a hint about backslash escaping.
+    """
+    current_text = arguments_text
+    for attempt in range(max_attempts):
+        # Step a: plain parse
+        try:
+            return json.loads(current_text)
+        except json.JSONDecodeError:
+            pass
+
+        # Step b: auto-repair backslashes then parse
+        try:
+            return json.loads(repair_json_backslashes(current_text))
+        except json.JSONDecodeError:
+            pass
+
+        # Step c: ask the LLM to fix it (skip on the last attempt)
+        if attempt < max_attempts - 1:
+            repair_prompt = _JSON_REPAIR_USER_TMPL.format(text=current_text)
+            try:
+                repaired_text, _ = get_response_from_llm(
+                    prompt=repair_prompt,
+                    client=client,
+                    model=model,
+                    system_message=_JSON_REPAIR_SYSTEM,
+                )
+                # Strip markdown fences the LLM might still add
+                repaired_text = repaired_text.strip()
+                if repaired_text.startswith("```"):
+                    repaired_text = re.sub(
+                        r"^```[a-z]*\s*", "", repaired_text, flags=re.IGNORECASE
+                    ).rstrip("`").strip()
+                current_text = repaired_text
+            except Exception as exc:
+                print(
+                    f"LLM re-prompt for JSON repair failed (attempt {attempt + 1}): {exc}"
+                )  # keep current_text; next iteration will retry
+
+    preview = current_text[:_ERROR_PREVIEW_LENGTH]
+    raise ValueError(
+        f"Failed to parse FinalizeIdea arguments after {max_attempts} attempts. "
+        f"Preview of offending text: {preview!r}. "
+        "Hint: backslashes inside JSON strings must be doubled "
+        r"(e.g. \\alpha, not \alpha)."
+    )
+
+
 def generate_temp_free_idea(
     idea_fname: str,
     client: Any,
@@ -223,20 +366,21 @@ def generate_temp_free_idea(
                         except Exception as e:
                             last_tool_results = f"Error using tool {action}: {str(e)}"
                     elif action == "FinalizeIdea":
-                        # Parse arguments
-                        try:
-                            arguments_json = json.loads(arguments_text)
-                            idea = arguments_json.get("idea")
-                            if not idea:
-                                raise ValueError("Missing 'idea' in arguments.")
+                        # Parse arguments with robust retry/repair logic so that
+                        # JSON errors (e.g. unescaped LaTeX backslashes) never
+                        # silently drop an idea.
+                        arguments_json = parse_finalize_idea_args(
+                            arguments_text, client, model
+                        )
+                        idea = arguments_json.get("idea")
+                        if not idea:
+                            raise ValueError("Missing 'idea' in arguments.")
 
-                            # Append the idea to the archive
-                            idea_str_archive.append(json.dumps(idea))
-                            print(f"Proposal finalized: {idea}")
-                            idea_finalized = True
-                            break
-                        except json.JSONDecodeError:
-                            raise ValueError("Invalid arguments JSON for FinalizeIdea.")
+                        # Append the idea to the archive
+                        idea_str_archive.append(json.dumps(idea))
+                        print(f"Proposal finalized: {idea}")
+                        idea_finalized = True
+                        break
                     else:
                         print(
                             "Invalid action. Please specify one of the available tools."
