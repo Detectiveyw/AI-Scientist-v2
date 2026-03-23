@@ -51,6 +51,12 @@ AVAILABLE_LLMS = [
     "gemini-2.0-flash",
     "gemini-2.5-flash-preview-04-17",
     "gemini-2.5-pro-preview-03-25",
+    # Zhipu/BigModel GLM models (routed via BigModel Anthropic-compatible gateway)
+    # Required env vars: ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL=https://open.bigmodel.cn/api/anthropic
+    # Optional: BIGMODEL_ANTHROPIC_MODEL (default: claude-3-5-sonnet-20241022)
+    "glm-4",
+    "glm-4-plus",
+    "glm-4-air",
     # GPT-OSS models via Ollama
     "ollama/gpt-oss:20b",
     "ollama/gpt-oss:120b",
@@ -481,6 +487,33 @@ def create_client(model) -> tuple[Any, str]:
     if model.startswith("claude-"):
         print(f"Using Anthropic API with model {model}.")
         return anthropic.Anthropic(), model
+    elif model.startswith("glm-"):
+        # Zhipu/BigModel GLM models via BigModel Anthropic-compatible gateway.
+        # Required env vars:
+        #   ANTHROPIC_API_KEY  - your BigModel API key
+        #   ANTHROPIC_BASE_URL - e.g. https://open.bigmodel.cn/api/anthropic
+        # Optional env var:
+        #   BIGMODEL_ANTHROPIC_MODEL - Anthropic model to send to gateway
+        #                              (default: claude-3-5-sonnet-20241022)
+        if "ANTHROPIC_API_KEY" not in os.environ:
+            raise ValueError(
+                "ANTHROPIC_API_KEY environment variable is not set. "
+                "Set it to your BigModel API key and set "
+                "ANTHROPIC_BASE_URL=https://open.bigmodel.cn/api/anthropic"
+            )
+        if "ANTHROPIC_BASE_URL" not in os.environ:
+            raise ValueError(
+                "ANTHROPIC_BASE_URL environment variable is not set. "
+                "Set it to https://open.bigmodel.cn/api/anthropic for BigModel gateway."
+            )
+        mapped_model = os.environ.get(
+            "BIGMODEL_ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022"
+        )
+        print(
+            f"Using BigModel Anthropic-compatible gateway for model {model} "
+            f"(mapped to {mapped_model})."
+        )
+        return anthropic.Anthropic(), mapped_model
     elif model.startswith("bedrock") and "claude" in model:
         client_model = model.split("/")[-1]
         print(f"Using Amazon Bedrock with model {client_model}.")
